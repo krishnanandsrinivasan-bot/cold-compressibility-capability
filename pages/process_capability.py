@@ -4,6 +4,7 @@ from datetime import date
 from io import BytesIO
 import math
 import re
+import inspect
 
 import numpy as np
 import pandas as pd
@@ -21,6 +22,28 @@ from capability import (
     sequence_chart,
 )
 from ui import hero
+
+
+# Guard against partial GitHub updates where the V2 page is used with the old V1
+# capability engine. Without this check Streamlit shows a cryptic TypeError.
+_expected_apis = {
+    "sequence_chart": (sequence_chart, 7),
+    "distribution_chart": (distribution_chart, 9),
+    "scenario_chart": (scenario_chart, 7),
+    "prepare_results_table": (prepare_results_table, 7),
+    "build_excel_report": (build_excel_report, 10),
+}
+_outdated = [
+    name for name, (func, min_params) in _expected_apis.items()
+    if len(inspect.signature(func).parameters) < min_params
+]
+if _outdated:
+    st.error(
+        "App file version mismatch: this V2 page is running with an older capability.py. "
+        "Replace capability.py in the GitHub repository with the V2.0.1 file, then Streamlit will rebuild automatically."
+    )
+    st.caption("Outdated API detected: " + ", ".join(_outdated))
+    st.stop()
 
 
 hero(
