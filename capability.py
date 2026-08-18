@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+CAPABILITY_API_VERSION = "2.0.1"
+
 from dataclasses import dataclass, asdict
 from io import BytesIO
 import math
