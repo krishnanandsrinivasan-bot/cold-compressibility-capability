@@ -18,7 +18,7 @@ pages = {
         st.Page("pages/home.py", title="Dashboard", icon="🏠", default=True),
     ],
     "Process & Quality": [
-        st.Page("pages/process_capability.py", title="Cpk / Ppk Analysis", icon="📊"),
+        st.Page("pages/process_capability.py", title="Process Capability", icon="📊"),
         st.Page("pages/compressibility.py", title="Compressibility Analysis", icon="🗜️"),
     ],
     "Performance": [
