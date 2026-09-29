@@ -21,6 +21,7 @@ from capability import (
     sequence_chart,
 )
 from ui import hero
+from report_pdf import build_capability_pdf
 
 
 hero(
@@ -388,12 +389,37 @@ with tab_export:
                 ws.set_column(1, 8, 20)
         return out.getvalue()
 
+    pdf_metadata = {
+        "Project": project,
+        "Supplier": supplier,
+        "Material / Grade": material,
+        "Batch / Scope": scope_or_batch,
+        "Evaluation date": evaluation_date.isoformat(),
+        "Test / source": source_note,
+    }
+    pdf_report = build_capability_pdf(
+        values=values,
+        result=result,
+        lsl=float(lsl),
+        usl=float(usl),
+        target=float(target),
+        requirement=float(requirement),
+        characteristic=characteristic,
+        unit=unit,
+        study_type=study_type,
+        is_serial=is_serial,
+        passed=passed,
+        metadata=pdf_metadata,
+        history=history,
+    )
+
     safe = re.sub(r"[^A-Za-z0-9_-]+", "_", characteristic.lower()).strip("_") or "capability"
     slug = "serial_ppk" if is_serial else "ppap_cpk"
-    e = st.columns(2)
-    e[0].download_button("Download capability report (.xlsx)", data=build_report(), file_name=f"{safe}_{slug}_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-    e[1].download_button("Download cleaned measurements (.csv)", data=results_df.to_csv(index=False).encode("utf-8"), file_name=f"{safe}_{slug}_measurements.csv", mime="text/csv", use_container_width=True)
-    st.caption(f"The report shows only the relevant acceptance index for this study: {primary_name} ≥ {requirement:.2f}.")
+    e = st.columns(3)
+    e[0].download_button("Download Excel report (.xlsx)", data=build_report(), file_name=f"{safe}_{slug}_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    e[1].download_button("Download professional report (.pdf)", data=pdf_report, file_name=f"{safe}_{slug}_report.pdf", mime="application/pdf", use_container_width=True, type="primary")
+    e[2].download_button("Download cleaned data (.csv)", data=results_df.to_csv(index=False).encode("utf-8"), file_name=f"{safe}_{slug}_measurements.csv", mime="text/csv", use_container_width=True)
+    st.caption(f"PDF is the presentation-ready engineering report; Excel contains the detailed calculation data. Acceptance: {primary_name} >= {requirement:.2f}.")
 
 st.divider()
 if is_serial:
