@@ -17,11 +17,11 @@ st.markdown("### Start here")
 left, right = st.columns([1.6, 1])
 with left:
     tool_card(
-        "📊 Cpk / Ppk Analysis",
-        "General process-capability tool for cold compressibility and other numerical pad characteristics. Import Excel/CSV, paste values, or enter data manually.",
+        "📊 Process Capability",
+        "PPAP/process-batch Cpk and cumulative serial-production Ppk for cold compressibility and other numerical pad characteristics.",
         "Live",
     )
-    st.page_link("pages/process_capability.py", label="Open Cpk / Ppk Analysis", icon="➡️", use_container_width=True)
+    st.page_link("pages/process_capability.py", label="Open Process Capability", icon="➡️", use_container_width=True)
 with right:
     st.markdown(
         """
@@ -61,4 +61,4 @@ st.write(
     "For example, the Cpk/Ppk engine can be used for cold compressibility, thickness, density, weight or another numerical characteristic simply by changing the characteristic, unit and specification limits."
 )
 
-st.caption("Pad Development Tools · V2 platform shell")
+st.caption("Pad Development Tools · V2.1")
