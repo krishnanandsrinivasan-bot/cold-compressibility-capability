@@ -6,8 +6,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-BATCH_COLUMNS=["Batch / Lot","Supplier","Material / Grade","Underlayer","Sample level","Production date","Pad drawing","Backplate drawing","Process status","Source sheet","Sequence"]
-PHYSICAL_COLUMNS=["Batch / Lot","Test","Result","Result numeric","Unit","LSL","USL","Target","Status","Source sheet","Source row"]
+BATCH_COLUMNS=["Batch / Lot","Supplier","Material / Grade","Underlayer","Sample level","Production date","Pad drawing","Backplate drawing","Process status","Reference batch","4M change","Process deviation","Notes","Source sheet","Sequence"]
+PHYSICAL_COLUMNS=["Batch / Lot","Test","Sample ID","Result","Result numeric","Unit","LSL","USL","Target","Status","Source sheet","Source row"]
 DYNO_COLUMNS=["Batch / Lot","Test","Metric","Run","Result","Result numeric","Unit","Min","Max","Target","Status","Source sheet","Source row"]
 UNMAPPED_COLUMNS=["Source sheet","Source row","Descriptor","Value","Reason"]
 
@@ -110,14 +110,48 @@ def _col_find(cols, aliases):
         if any(n==a or a in n for a in aliases): return c
     return None
 
+def _batch_master_parse(table: pd.DataFrame,sheet:str,seq_start:int):
+    cols=list(table.columns)
+    batch=_col_find(cols,["batch / lot","batch","lot","batch no","batch number"])
+    supplier=_col_find(cols,["supplier"])
+    material=_col_find(cols,["material / grade","material","grade"])
+    # A pure batch-master table does not need Test/Result columns.
+    if not batch or (supplier is None and material is None and norm(sheet)!="batches"):
+        return [],[],[],[],seq_start
+    field_aliases={
+        "Supplier":["supplier"],
+        "Material / Grade":["material / grade","material","grade"],
+        "Underlayer":["underlayer","ul"],
+        "Sample level":["sample level","sample"],
+        "Production date":["production date","date"],
+        "Pad drawing":["pad drawing"],
+        "Backplate drawing":["backplate drawing"],
+        "Process status":["process status"],
+        "Reference batch":["reference batch"],
+        "4M change":["4m change","4m"],
+        "Process deviation":["process deviation","deviation"],
+        "Notes":["notes","comment","remarks"],
+    }
+    mapped={field:_col_find(cols,aliases) for field,aliases in field_aliases.items()}
+    rows=[];seq=seq_start
+    for _,row in table.iterrows():
+        b=s(row.get(batch))
+        if not b: continue
+        seq+=1
+        rec={"Batch / Lot":b,"Source sheet":sheet,"Sequence":seq}
+        for field,col in mapped.items():
+            rec[field]=s(row.get(col)) if col else ""
+        rows.append(rec)
+    return rows,[],[],[],seq
+
 def _long_parse(table: pd.DataFrame,sheet:str,seq_start:int):
     cols=list(table.columns)
     batch=_col_find(cols,["batch","lot","batch / lot","batch no","batch number"])
     test=_col_find(cols,["test","parameter","characteristic"])
-    value=_col_find(cols,["result","value","measured"])
+    value=_col_find(cols,["result","value","measured","measurement"])
     if not(batch and test and value): return [],[],[],[],seq_start
     unit=_col_find(cols,["unit"]); lsl=_col_find(cols,["lsl","lower"]); usl=_col_find(cols,["usl","upper"]); target=_col_find(cols,["target","nominal"])
-    metric=_col_find(cols,["metric"]); run=_col_find(cols,["run","repeat"]); supplier=_col_find(cols,["supplier"]); material=_col_find(cols,["material","grade"]); underlayer=_col_find(cols,["underlayer","ul"])
+    metric=_col_find(cols,["metric"]); run=_col_find(cols,["run","repeat"]); sample_id=_col_find(cols,["sample id","pad id","sample"]); supplier=_col_find(cols,["supplier"]); material=_col_find(cols,["material","grade"]); underlayer=_col_find(cols,["underlayer","ul"])
     batches=[]; phys=[]; dyno=[]; unm=[]; seq=seq_start; seen={}
     for ri,row in table.iterrows():
         b=s(row.get(batch)); t=s(row.get(test)); v=row.get(value)
@@ -126,7 +160,7 @@ def _long_parse(table: pd.DataFrame,sheet:str,seq_start:int):
             seq+=1; seen[b]=seq
             batches.append({"Batch / Lot":b,"Supplier":s(row.get(supplier)) if supplier else "","Material / Grade":s(row.get(material)) if material else "","Underlayer":s(row.get(underlayer)) if underlayer else "","Source sheet":sheet,"Sequence":seq})
         role=role_for(t,sheet)
-        common={"Batch / Lot":b,"Test":t,"Result":v,"Result numeric":num(v),"Unit":s(row.get(unit)) if unit else "","Target":num(row.get(target)) if target else None,"Status":None,"Source sheet":sheet,"Source row":int(ri)+2}
+        common={"Batch / Lot":b,"Test":t,"Sample ID":s(row.get(sample_id)) if sample_id else "","Result":v,"Result numeric":num(v),"Unit":s(row.get(unit)) if unit else "","Target":num(row.get(target)) if target else None,"Status":None,"Source sheet":sheet,"Source row":int(ri)+2}
         if role=="dyno":
             rec={**common,"Metric":s(row.get(metric)) if metric else t,"Run":s(row.get(run)) if run else "","Min":num(row.get(lsl)) if lsl else None,"Max":num(row.get(usl)) if usl else None}
             rec["Status"]=status(v,rec["Min"],rec["Max"]); dyno.append(rec)
@@ -158,7 +192,7 @@ def _row_table_parse(raw: pd.DataFrame,sheet:str,seq_start:int):
         for c in classed:
             v=row.get(c); role=role_for(c,sheet)
             if role=="physical":
-                phys.append({"Batch / Lot":b,"Test":str(c),"Result":v,"Result numeric":num(v),"Unit":"","LSL":None,"USL":None,"Target":None,"Status":status(v),"Source sheet":sheet,"Source row":int(ri)+h+2})
+                phys.append({"Batch / Lot":b,"Test":str(c),"Sample ID":"","Result":v,"Result numeric":num(v),"Unit":"","LSL":None,"USL":None,"Target":None,"Status":status(v),"Source sheet":sheet,"Source row":int(ri)+h+2})
             else:
                 dyno.append({"Batch / Lot":b,"Test":str(c),"Metric":str(c),"Run":"","Result":v,"Result numeric":num(v),"Unit":"","Min":None,"Max":None,"Target":None,"Status":status(v),"Source sheet":sheet,"Source row":int(ri)+h+2})
     return batches,phys,dyno,unm,seq
@@ -201,7 +235,7 @@ def _wide_parse(raw: pd.DataFrame,sheet:str,seq_start:int):
         for j,b in batch_names.items():
             v=raw.iat[ri,j]
             if role=="physical":
-                phys.append({"Batch / Lot":b,"Test":descriptor,"Result":v,"Result numeric":num(v),"Unit":unit,"LSL":lo,"USL":hi,"Target":tar,"Status":status(v,lo,hi),"Source sheet":sheet,"Source row":ri+1})
+                phys.append({"Batch / Lot":b,"Test":descriptor,"Sample ID":"","Result":v,"Result numeric":num(v),"Unit":unit,"LSL":lo,"USL":hi,"Target":tar,"Status":status(v,lo,hi),"Source sheet":sheet,"Source row":ri+1})
             else:
                 dyno.append({"Batch / Lot":b,"Test":descriptor,"Metric":descriptor,"Run":"","Result":v,"Result numeric":num(v),"Unit":unit,"Min":lo,"Max":hi,"Target":tar,"Status":status(v,lo,hi),"Source sheet":sheet,"Source row":ri+1})
     batches=[];seq=seq_start
@@ -225,7 +259,7 @@ def parse_lds_workbook(raw_bytes: bytes)->LDSData:
         if raw.empty:
             diag.append({"Sheet":sheet,"Rows":0,"Columns":0,"Detected layout":"empty","Batches":0,"Physical records":0,"Dyno records":0,"Unmapped rows":0});continue
         h=header_row(raw);headers=_unique_headers(raw.iloc[h].tolist());table=raw.iloc[h+1:].copy();table.columns=headers
-        candidates=[("long",_long_parse(table,sheet,seq)),("row-table",_row_table_parse(raw,sheet,seq)),("wide-matrix",_wide_parse(raw,sheet,seq))]
+        candidates=[("batch-master",_batch_master_parse(table,sheet,seq)),("long",_long_parse(table,sheet,seq)),("row-table",_row_table_parse(raw,sheet,seq)),("wide-matrix",_wide_parse(raw,sheet,seq))]
         layout,res=max(candidates,key=lambda x: len(x[1][1])+len(x[1][2])+len(x[1][0])*0.2)
         b,p,d,u,newseq=res
         if not (b or p or d):
