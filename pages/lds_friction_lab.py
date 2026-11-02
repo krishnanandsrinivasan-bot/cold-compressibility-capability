@@ -1,535 +1,183 @@
 from __future__ import annotations
-
 from io import BytesIO
-import json
-import math
+from zipfile import ZipFile, ZIP_DEFLATED
 import re
-
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 from ui import hero
+from lds_engine import parse_lds_workbook
+from lds_report_pdf import build_lds_pdf, comparison_figure, completeness_figure, chart_png_bytes, status_heatmap
 
+hero("LDS Friction Lab", "Upload one LDS workbook and automatically analyze batches, physicals, dyno results, trends, gaps and comparisons.")
+st.info("**One LDS file = one engineering workspace.** Data is parsed in-session only and is not written to the public GitHub repository.")
 
-hero(
-    "LDS Friction Lab",
-    "Supplier-development workspace for friction batches, process traceability, physical properties, dyno results, comparisons, gaps and actions.",
-)
+@st.cache_data(show_spinner=False)
+def parse_lds(raw: bytes):
+    return parse_lds_workbook(raw)
 
-st.info(
-    "LDS data is kept in the current Streamlit session only. Export a workspace backup before closing the session. "
-    "This avoids writing supplier/project data into the public GitHub repository."
-)
-
-BATCH_COLUMNS = [
-    "Batch / Lot", "Supplier", "Material / Grade", "Underlayer", "Sample level",
-    "Manufacturing stage", "Pad drawing", "Backplate drawing", "Production date",
-    "Process status", "4M change", "Process deviation", "Reference batch", "Notes",
-]
-PHYSICAL_COLUMNS = [
-    "Batch / Lot", "Test", "Result", "Unit", "LSL", "USL", "Target", "Sample count",
-    "Status", "Test date", "Source / Report", "Notes",
-]
-DYNO_COLUMNS = [
-    "Batch / Lot", "Test", "Run", "Metric", "Result", "Unit", "Min", "Max",
-    "Status", "Disc / Rotor", "Test date", "Source / Report", "Notes",
-]
-ACTION_COLUMNS = [
-    "Area", "Batch / Lot", "Action / Gap", "Owner", "Due date", "Priority", "Status", "Notes",
-]
-
-PHYSICAL_TESTS = [
-    "Cold Compressibility (K3)", "Hot Compressibility", "Heat Transfer", "Shear Strength",
-    "Peel Resistance", "Underlayer Distribution", "Natural Frequency", "Density",
-    "Pad Thickness", "Backplate Thickness", "T-Pull", "Corrosion", "XRF", "pH",
-    "TGA", "Moisture", "Sticking / Adhesion", "Other",
-]
-DYNO_TESTS = [
-    "AK-Master", "AMS / HAMS", "Static μ", "Wear", "Mojacar", "EPB Holding Torque",
-    "Rust Removal", "WLTP / Brake Emission", "High-Temperature Outgassing", "Krauss",
-    "ECE R13", "Salt / Water Spray", "Stiction Corrosion", "DTV / BTV", "Flaming", "MPU", "Other",
-]
-
-
-def empty_df(columns):
-    return pd.DataFrame(columns=columns)
-
-
-def ensure_workspace():
-    defaults = {
-        "lds_batches": empty_df(BATCH_COLUMNS),
-        "lds_physicals": empty_df(PHYSICAL_COLUMNS),
-        "lds_dyno": empty_df(DYNO_COLUMNS),
-        "lds_actions": empty_df(ACTION_COLUMNS),
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value.copy()
-
-
-def clean_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    if df is None:
-        return empty_df(columns)
-    out = df.copy()
-    out.columns = [str(c).strip() for c in out.columns]
-    for col in columns:
-        if col not in out.columns:
-            out[col] = None
-    out = out[columns]
-    out = out.replace({np.nan: None})
-    return out.reset_index(drop=True)
-
-
-def to_num(value):
-    if value is None or (isinstance(value, float) and math.isnan(value)):
-        return None
-    try:
-        if isinstance(value, str):
-            v = value.strip()
-            if not v:
-                return None
-            v = v.replace(",", ".")
-            match = re.search(r"[-+]?\d+(?:\.\d+)?", v)
-            if not match:
-                return None
-            return float(match.group())
-        return float(value)
-    except Exception:
-        return None
-
-
-def auto_status(result, lsl=None, usl=None):
-    if result is None or str(result).strip() == "":
-        return "OPEN"
-    r = to_num(result)
-    lo = to_num(lsl)
-    hi = to_num(usl)
-    if r is not None:
-        if lo is not None and r < lo:
-            return "FAIL"
-        if hi is not None and r > hi:
-            return "FAIL"
-        if lo is not None or hi is not None:
-            return "PASS"
-        return "RESULT"
-    txt = str(result).strip().lower()
-    if any(x in txt for x in ["nok", "fail", "not ok", "outside"]):
-        return "FAIL"
-    if any(x in txt for x in ["ok", "pass", "within"]):
-        return "PASS"
-    return "RESULT"
-
-
-def recalc_status(df: pd.DataFrame, lower_col: str, upper_col: str):
-    out = df.copy()
-    if "Status" not in out:
-        out["Status"] = None
-    statuses = []
-    for _, row in out.iterrows():
-        current = str(row.get("Status") or "").strip().upper()
-        if current in {"OPEN", "PASS", "FAIL", "RESULT", "N.A.", "NA", "CARRYOVER"}:
-            if current in {"PASS", "FAIL"} and row.get("Result") not in [None, ""]:
-                statuses.append(auto_status(row.get("Result"), row.get(lower_col), row.get(upper_col)))
-            else:
-                statuses.append(current)
-        else:
-            statuses.append(auto_status(row.get("Result"), row.get(lower_col), row.get(upper_col)))
-    out["Status"] = statuses
-    return out
-
-
-def classify_sheet(name: str, df: pd.DataFrame) -> str:
-    n = name.lower()
-    cols = " ".join(str(c).lower() for c in df.columns)
-    if "action" in n or "owner" in cols or "due date" in cols:
-        return "Actions"
-    if "dyno" in n or any(k in cols for k in ["rotor", "disc", "run", "ak-master", "ak master"]):
-        return "Dyno"
-    if "phys" in n or any(k in cols for k in ["lsl", "usl", "sample count", "heat transfer", "compressibility"]):
-        return "Physicals"
-    if "batch" in n or any(k in cols for k in ["supplier", "material", "underlayer", "4m"]):
-        return "Batches"
-    return "Unmapped"
-
-
-def map_columns(df: pd.DataFrame, target_columns: list[str], prefix: str):
-    st.caption("Map source columns to LDS fields. Unmapped fields stay blank.")
-    source_cols = [None] + list(df.columns)
-    aliases = {
-        "Batch / Lot": ["batch", "lot", "batch no", "batch number"],
-        "Supplier": ["supplier"],
-        "Material / Grade": ["material", "grade", "friction material"],
-        "Underlayer": ["underlayer", "ul"],
-        "Sample level": ["sample", "level"],
-        "Test": ["test", "characteristic", "parameter"],
-        "Metric": ["metric", "parameter"],
-        "Result": ["result", "value", "measured"],
-        "Unit": ["unit"],
-        "LSL": ["lsl", "min", "lower"],
-        "USL": ["usl", "max", "upper"],
-        "Min": ["min", "lower"],
-        "Max": ["max", "upper"],
-        "Target": ["target", "nominal"],
-        "Sample count": ["sample count", "n", "qty", "quantity"],
-        "Run": ["run", "repeat"],
-        "Source / Report": ["source", "report", "reference", "ref"],
-        "Disc / Rotor": ["disc", "rotor"],
-        "Owner": ["owner", "responsible"],
-        "Due date": ["due", "deadline"],
-        "Action / Gap": ["action", "gap", "open point"],
-        "Priority": ["priority"],
-        "Status": ["status"],
-        "Notes": ["note", "comment", "remark"],
-    }
-    lower_lookup = {str(c).strip().lower(): c for c in df.columns}
-    defaults = {}
-    for tgt in target_columns:
-        for a in aliases.get(tgt, []):
-            match = next((orig for low, orig in lower_lookup.items() if a == low or a in low), None)
-            if match is not None:
-                defaults[tgt] = match
-                break
-    mapped = {}
-    cols = st.columns(3)
-    for i, tgt in enumerate(target_columns):
-        default_value = defaults.get(tgt)
-        idx = source_cols.index(default_value) if default_value in source_cols else 0
-        mapped[tgt] = cols[i % 3].selectbox(tgt, source_cols, index=idx, key=f"{prefix}_{i}_{tgt}")
-    out = pd.DataFrame(index=df.index)
-    for tgt in target_columns:
-        src = mapped[tgt]
-        out[tgt] = df[src] if src is not None else None
-    return clean_frame(out, target_columns)
-
-
-def workspace_excel_bytes():
-    out = BytesIO()
-    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        st.session_state.lds_batches.to_excel(writer, index=False, sheet_name="Batches")
-        st.session_state.lds_physicals.to_excel(writer, index=False, sheet_name="Physicals")
-        st.session_state.lds_dyno.to_excel(writer, index=False, sheet_name="Dyno")
-        st.session_state.lds_actions.to_excel(writer, index=False, sheet_name="Actions")
-        wb = writer.book
-        header = wb.add_format({"bold": True, "bg_color": "#1F4E78", "font_color": "white"})
-        for ws in writer.sheets.values():
-            ws.set_row(0, None, header)
-            ws.freeze_panes(1, 0)
-            ws.set_column(0, max(ws.dim_colmax or 1, 1), 20)
+def demo_bytes():
+    rows=[
+      ["Parameter","Unit","LSL","USL","440122","453321","453901","454204"],
+      ["Supplier","","","","ITT","ITT","ITT","ITT"],
+      ["Material","","","","GA7900-D04","GA7900-D21","GA7900-D21","GA7900-D21"],
+      ["Underlayer","","","","UL80","UL65","UL65","UL65"],
+      ["Sample level","","","","B","C1","C1","C2"],
+      ["Cold Compressibility (K3)","µm",75,125,100,103,108,105],
+      ["Heat Transfer","°C","",200,190,198,205,196],
+      ["Shear Strength","kN",2.5,"",3.1,3.0,2.8,3.2],
+      ["AK-Master minimum mu","",0.33,"",0.35,0.34,0.32,0.35],
+      ["AMS max temperature","°C","",650,610,620,645,635],
+      ["Wear pad","mm","",1.5,1.1,1.2,1.4,1.3],
+      ["EPB Holding Torque","Nm",1500,"",1600,1580,"",1620],
+      ["WLTP Brake Emission","mg/km","",3.0,2.6,2.8,3.2,2.7],
+    ]
+    out=BytesIO()
+    with pd.ExcelWriter(out,engine="xlsxwriter") as w:
+        pd.DataFrame(rows).to_excel(w,index=False,header=False,sheet_name="LDS")
     return out.getvalue()
 
+def numeric(df,test,batches):
+    d=df[(df["Batch / Lot"].astype(str).isin(batches)) & (df["Test"].astype(str)==str(test))].copy()
+    d["Result numeric"]=pd.to_numeric(d["Result numeric"],errors="coerce")
+    return d.dropna(subset=["Result numeric"])
 
-def demo_workspace():
-    st.session_state.lds_batches = pd.DataFrame([
-        ["TW0676", "TMD", "PA4830", "7CM", "Preselection", "Prototype", "0204N60880", "0204N60891", "", "Development", "No", "", "", "Reference preselection batch"],
-        ["TW0677", "TMD", "PA4830", "7CM", "Preselection", "Prototype", "0204N60880", "0204N60891", "", "Development", "No", "", "TW0676", "Second preselection batch"],
-    ], columns=BATCH_COLUMNS)
-    st.session_state.lds_physicals = pd.DataFrame([
-        ["TW0676", "Cold Compressibility (K3)", 101, "µm", 75, 125, 100, 16, "PASS", "", "Demo", ""],
-        ["TW0676", "Heat Transfer", 198, "°C", None, 200, None, 4, "PASS", "", "Demo", ""],
-        ["TW0676", "Peel Resistance", None, "N/mm", None, None, None, None, "OPEN", "", "", "Not yet tested"],
-        ["TW0677", "Cold Compressibility (K3)", 104, "µm", 75, 125, 100, 16, "PASS", "", "Demo", ""],
-        ["TW0677", "Natural Frequency", None, "Hz", None, None, None, None, "OPEN", "", "", "Missing evidence"],
-    ], columns=PHYSICAL_COLUMNS)
-    st.session_state.lds_dyno = pd.DataFrame([
-        ["TW0676", "AK-Master", 1, "Minimum µ", 0.34, "", 0.33, None, "PASS", "", "", "Demo", ""],
-        ["TW0676", "Wear", 1, "Pad wear", 1.2, "mm", None, 1.5, "PASS", "", "", "Demo", ""],
-        ["TW0677", "AK-Master", 1, "Minimum µ", 0.32, "", 0.33, None, "FAIL", "", "", "Demo", "Below minimum criterion"],
-        ["TW0677", "EPB Holding Torque", 1, "Holding torque", None, "Nm", None, None, "OPEN", "", "", "", "Result pending"],
-        ["TW0677", "WLTP / Brake Emission", 1, "PM", None, "mg/km", None, None, "OPEN", "", "", "", "Not yet tested"],
-    ], columns=DYNO_COLUMNS)
-    st.session_state.lds_actions = pd.DataFrame([
-        ["Physicals", "TW0676", "Complete peel resistance", "", "", "Medium", "Open", ""],
-        ["Physicals", "TW0677", "Provide natural-frequency evidence", "", "", "Medium", "Open", ""],
-        ["Dyno", "TW0677", "Review AK-Master minimum µ result", "", "", "High", "Open", ""],
-        ["Dyno", "TW0677", "Complete EPB holding torque", "", "", "High", "Open", ""],
-    ], columns=ACTION_COLUMNS)
+def add_limits(fig,d):
+    lo="LSL" if "LSL" in d.columns else ("Min" if "Min" in d.columns else None)
+    hi="USL" if "USL" in d.columns else ("Max" if "Max" in d.columns else None)
+    for col,label in [(lo,"Lower"),(hi,"Upper")]:
+        if col:
+            vals=pd.to_numeric(d[col],errors="coerce").dropna().unique()
+            if len(vals)==1: fig.add_hline(y=float(vals[0]),line_dash="dash",annotation_text=f"{label} {vals[0]:g}")
+    return fig
 
+def matrix(df,batches):
+    if df.empty:return pd.DataFrame()
+    d=df[df["Batch / Lot"].astype(str).isin(batches)].copy()
+    d["Display"]=d.apply(lambda r: f"{'' if pd.isna(r['Result']) else r['Result']} {r.get('Unit') or ''} [{r.get('Status') or ''}]".strip(),axis=1)
+    return d.pivot_table(index="Test",columns="Batch / Lot",values="Display",aggfunc=lambda x:" | ".join(dict.fromkeys(map(str,x)))).reindex(columns=[b for b in batches if b in set(d["Batch / Lot"].astype(str))])
 
-ensure_workspace()
+def completeness(p,d,batches):
+    rows=[]
+    for b in batches:
+        pb=p[p["Batch / Lot"].astype(str)==b]; db=d[d["Batch / Lot"].astype(str)==b]
+        total=len(pb)+len(db); open_n=int((pb["Status"].astype(str).str.upper()=="OPEN").sum())+int((db["Status"].astype(str).str.upper()=="OPEN").sum())
+        fail=int((pb["Status"].astype(str).str.upper()=="FAIL").sum())+int((db["Status"].astype(str).str.upper()=="FAIL").sum())
+        rows.append({"Batch / Lot":b,"Records":total,"Completed":total-open_n,"Open":open_n,"Fail":fail,"Completeness %":round(100*(total-open_n)/total,1) if total else np.nan})
+    return pd.DataFrame(rows)
 
-with st.sidebar:
-    st.divider()
-    st.subheader("LDS workspace")
-    if st.button("Load demo workspace", use_container_width=True):
-        demo_workspace()
-        st.rerun()
-    if st.button("Clear workspace", use_container_width=True):
-        st.session_state.lds_batches = empty_df(BATCH_COLUMNS)
-        st.session_state.lds_physicals = empty_df(PHYSICAL_COLUMNS)
-        st.session_state.lds_dyno = empty_df(DYNO_COLUMNS)
-        st.session_state.lds_actions = empty_df(ACTION_COLUMNS)
-        st.rerun()
-    st.download_button(
-        "Export LDS backup (.xlsx)",
-        workspace_excel_bytes(),
-        "LDS_Friction_Lab_Backup.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+def excel_export(name,batches,p,d,unmapped,diag,selected):
+    out=BytesIO(); gaps=pd.concat([p[p.Status.astype(str).str.upper().isin(["OPEN","FAIL"])].assign(Area="Physicals"),d[d.Status.astype(str).str.upper().isin(["OPEN","FAIL"])].assign(Area="Dyno")],ignore_index=True,sort=False)
+    with pd.ExcelWriter(out,engine="xlsxwriter") as w:
+        pd.DataFrame([["Source LDS",name],["Selected batches",len(selected)],["Physical records",len(p)],["Dyno records",len(d)],["Unmapped rows",len(unmapped)]],columns=["Metric","Value"]).to_excel(w,index=False,sheet_name="Summary")
+        completeness(p,d,selected).to_excel(w,index=False,sheet_name="Completeness")
+        batches[batches["Batch / Lot"].astype(str).isin(selected)].to_excel(w,index=False,sheet_name="Batches")
+        p.to_excel(w,index=False,sheet_name="Physicals"); d.to_excel(w,index=False,sheet_name="Dyno"); gaps.to_excel(w,index=False,sheet_name="Open Gaps")
+        matrix(p,selected).to_excel(w,sheet_name="Physical Matrix"); matrix(d,selected).to_excel(w,sheet_name="Dyno Matrix")
+        diag.to_excel(w,index=False,sheet_name="Import Diagnostics"); unmapped.to_excel(w,index=False,sheet_name="Unmapped")
+        wb=w.book; hdr=wb.add_format({"bold":True,"bg_color":"#1F4E78","font_color":"white"})
+        for ws in w.sheets.values(): ws.set_row(0,None,hdr); ws.freeze_panes(1,0); ws.set_column(0,20,20)
+    return out.getvalue()
 
-batches = st.session_state.lds_batches
-phys = recalc_status(st.session_state.lds_physicals, "LSL", "USL")
-dyno = recalc_status(st.session_state.lds_dyno, "Min", "Max")
-actions = st.session_state.lds_actions
-st.session_state.lds_physicals = phys
-st.session_state.lds_dyno = dyno
+def graphic_zip(p,d,batches,pt,dt):
+    out=BytesIO()
+    with ZipFile(out,"w",ZIP_DEFLATED) as z:
+        z.writestr("01_Completeness.png",chart_png_bytes(completeness_figure(p,d,batches)))
+        z.writestr("02_Physicals_Status.png",chart_png_bytes(status_heatmap(p,batches,"Physical Status Matrix")))
+        z.writestr("03_Dyno_Status.png",chart_png_bytes(status_heatmap(d,batches,"Dyno Status Matrix")))
+        if pt:z.writestr("04_Physical_Comparison.png",chart_png_bytes(comparison_figure(p,batches,pt,f"Physical Comparison - {pt}")))
+        if dt:z.writestr("05_Dyno_Comparison.png",chart_png_bytes(comparison_figure(d,batches,dt,f"Dyno Comparison - {dt}")))
+    return out.getvalue()
 
-open_phys = int((phys["Status"].astype(str).str.upper() == "OPEN").sum()) if len(phys) else 0
-fail_phys = int((phys["Status"].astype(str).str.upper() == "FAIL").sum()) if len(phys) else 0
-open_dyno = int((dyno["Status"].astype(str).str.upper() == "OPEN").sum()) if len(dyno) else 0
-fail_dyno = int((dyno["Status"].astype(str).str.upper() == "FAIL").sum()) if len(dyno) else 0
-open_actions = int(actions["Status"].astype(str).str.lower().isin(["open", "in progress", "ongoing"]).sum()) if len(actions) else 0
+u1,u2=st.columns([5,1])
+uploaded=u1.file_uploader("Upload LDS workbook",type=["xlsx","xls"],help="The importer scans all sheets and detects batch IDs, physical characteristics and dyno tests.")
+if u2.button("Use demo LDS",use_container_width=True): st.session_state["lds_demo_v4"]=demo_bytes()
+raw=uploaded.getvalue() if uploaded else st.session_state.get("lds_demo_v4")
+name=uploaded.name if uploaded else ("Demo_LDS.xlsx" if raw else "")
+if raw is None:
+    st.markdown("### What happens after upload")
+    st.write("The app creates a normalized batch database from the LDS and unlocks batch profiles, physical/dyno comparisons, trend charts, histograms, gap analysis and exports.")
+    st.stop()
 
-m = st.columns(5)
-m[0].metric("Batches", len(batches))
-m[1].metric("Physical gaps", open_phys, delta=f"{fail_phys} fail" if fail_phys else None, delta_color="inverse")
-m[2].metric("Dyno gaps", open_dyno, delta=f"{fail_dyno} fail" if fail_dyno else None, delta_color="inverse")
-m[3].metric("Open actions", open_actions)
-m[4].metric("Evidence records", len(phys) + len(dyno))
+with st.spinner("Parsing LDS workbook..."): data=parse_lds(raw)
+batches,phys,dyno,unmapped,diag=data.batches.copy(),data.physicals.copy(),data.dyno.copy(),data.unmapped.copy(),data.diagnostics.copy()
+all_batches=list(dict.fromkeys([str(x) for x in pd.concat([batches.get("Batch / Lot",pd.Series(dtype=object)),phys.get("Batch / Lot",pd.Series(dtype=object)),dyno.get("Batch / Lot",pd.Series(dtype=object))],ignore_index=True).dropna() if str(x).strip()]))
+if not all_batches:
+    st.error("The workbook opened, but no batch IDs were detected. Check Import Diagnostics below or provide one representative LDS file so the parser can be adapted exactly.")
+    st.dataframe(diag,use_container_width=True,hide_index=True); st.stop()
 
-tabs = st.tabs(["Overview", "Batches", "Physicals", "Dyno", "Compare", "Actions", "Import / Export"])
+st.markdown("### Select batches")
+selected=st.multiselect("Batches / lots included in analysis",all_batches,default=all_batches if len(all_batches)<=6 else all_batches[-5:])
+if not selected:st.stop()
+p=phys[phys["Batch / Lot"].astype(str).isin(selected)].copy(); d=dyno[dyno["Batch / Lot"].astype(str).isin(selected)].copy(); b=batches[batches["Batch / Lot"].astype(str).isin(selected)].copy()
+status=pd.concat([p.get("Status",pd.Series(dtype=object)),d.get("Status",pd.Series(dtype=object))],ignore_index=True).astype(str).str.upper()
+open_n=int((status=="OPEN").sum()); fail_n=int((status=="FAIL").sum())
+metrics=st.columns(6); metrics[0].metric("Batches",len(selected)); metrics[1].metric("Physical records",len(p)); metrics[2].metric("Dyno records",len(d)); metrics[3].metric("Open gaps",open_n); metrics[4].metric("Failed criteria",fail_n); metrics[5].metric("Unmapped rows",len(unmapped))
+ptests=sorted({str(x) for x in p.get("Test",pd.Series(dtype=object)).dropna() if str(x).strip()}); dtests=sorted({str(x) for x in d.get("Test",pd.Series(dtype=object)).dropna() if str(x).strip()})
 
+tabs=st.tabs(["Dashboard","Batch Profile","Physicals","Dyno","Batch Comparison","Charts & Trends","Gaps / Quality","Export","Import Diagnostics"])
 with tabs[0]:
-    st.markdown("### Development status")
-    c1, c2 = st.columns([1.2, 1])
+    comp=completeness(p,d,selected); c1,c2=st.columns([1.4,1])
     with c1:
-        status_rows = []
-        for label, df in [("Physicals", phys), ("Dyno", dyno)]:
-            if len(df):
-                counts = df["Status"].fillna("OPEN").astype(str).str.upper().value_counts()
-                for status, count in counts.items():
-                    status_rows.append({"Area": label, "Status": status, "Count": int(count)})
-        if status_rows:
-            fig = px.bar(pd.DataFrame(status_rows), x="Area", y="Count", color="Status", barmode="stack", title="Evidence status")
-            fig.update_layout(template="plotly_white", legend_title_text="")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No LDS records yet. Import a workbook, enter data, or load the demo workspace.")
+        m=comp.melt(id_vars=["Batch / Lot"],value_vars=["Completed","Open"],var_name="Evidence",value_name="Records")
+        fig=px.bar(m,x="Batch / Lot",y="Records",color="Evidence",barmode="stack",title="LDS evidence completeness");fig.update_layout(template="plotly_white",legend_title_text="");st.plotly_chart(fig,use_container_width=True)
     with c2:
         st.markdown("#### Engineering attention")
-        issues = []
-        if fail_phys:
-            issues.append(f"**{fail_phys} physical result(s)** outside numeric criteria.")
-        if fail_dyno:
-            issues.append(f"**{fail_dyno} dyno result(s)** outside numeric criteria.")
-        if open_phys:
-            issues.append(f"**{open_phys} physical test(s)** still open.")
-        if open_dyno:
-            issues.append(f"**{open_dyno} dyno result(s)** still open.")
-        missing_sources = 0
-        for df in [phys, dyno]:
-            if len(df):
-                missing_sources += int(
-                    (df["Result"].notna())
-                    & (df["Result"].astype(str).str.strip() != "")
-                    & (df["Source / Report"].fillna("").astype(str).str.strip() == "")
-                ).sum()
-        if missing_sources:
-            issues.append(f"**{missing_sources} completed result(s)** have no source/report reference.")
-        if len(batches):
-            changes = int(batches["4M change"].fillna("").astype(str).str.lower().isin(["yes", "y", "true", "changed"]).sum())
-            if changes:
-                issues.append(f"**{changes} batch(es)** indicate a 4M/process change.")
-        if not issues:
-            st.success("No open rule-based issues detected in the current workspace.")
-        else:
-            for issue in issues:
-                st.markdown(f"- {issue}")
-
-    if len(batches):
-        st.markdown("### Batch passports")
-        cols = ["Batch / Lot", "Supplier", "Material / Grade", "Underlayer", "Sample level", "Manufacturing stage", "Process status", "4M change"]
-        st.dataframe(batches[cols], use_container_width=True, hide_index=True)
-
+        if fail_n:st.error(f"{fail_n} numeric result(s) fail imported criteria.")
+        if open_n:st.warning(f"{open_n} LDS result(s) are open / blank.")
+        if len(unmapped):st.info(f"{len(unmapped)} row(s) could not be classified automatically.")
+        if not(fail_n or open_n or len(unmapped)):st.success("No automatic issues detected.")
+    st.dataframe(comp,use_container_width=True,hide_index=True)
+    if len(b):st.dataframe(b,use_container_width=True,hide_index=True)
 with tabs[1]:
-    st.markdown("### Batch passport & process traceability")
-    st.caption("Capture the batch identity and process sameness before interpreting physical or dyno results.")
-    edited = st.data_editor(
-        batches, num_rows="dynamic", use_container_width=True, hide_index=True, key="lds_batch_editor",
-        column_config={
-            "Production date": st.column_config.TextColumn(help="Date or supplier production reference"),
-            "4M change": st.column_config.SelectboxColumn(options=["No", "Yes", "Unknown"], default="Unknown"),
-            "Process status": st.column_config.SelectboxColumn(options=["Development", "Frozen process", "Serial intent", "Released", "Unknown"], default="Development"),
-        },
-    )
-    st.session_state.lds_batches = clean_frame(edited, BATCH_COLUMNS)
-
+    batch=st.selectbox("Batch / Lot",selected,key="lds_profile")
+    meta=b[b["Batch / Lot"].astype(str)==batch]
+    if len(meta):
+        row=meta.iloc[0]; cs=st.columns(4)
+        for i,f in enumerate(["Supplier","Material / Grade","Underlayer","Sample level","Production date","Pad drawing","Backplate drawing","Process status"]):cs[i%4].metric(f,str(row.get(f) or "-"))
+    c1,c2=st.columns(2); c1.dataframe(p[p["Batch / Lot"].astype(str)==batch],use_container_width=True,hide_index=True);c2.dataframe(d[d["Batch / Lot"].astype(str)==batch],use_container_width=True,hide_index=True)
 with tabs[2]:
-    st.markdown("### Physical properties")
-    st.caption("Track each supplier batch against limits and keep the source/report reference with the result.")
-    f1, f2, f3 = st.columns([1, 1, 2])
-    batch_options = ["All"] + sorted({str(x) for x in phys["Batch / Lot"].dropna() if str(x).strip()})
-    sel_batch = f1.selectbox("Batch filter", batch_options, key="phys_batch_filter")
-    sel_status = f2.selectbox("Status filter", ["All", "OPEN", "PASS", "FAIL", "RESULT", "N.A.", "CARRYOVER"], key="phys_status_filter")
-    search = f3.text_input("Search test / notes", key="phys_search")
-    shown = phys.copy()
-    if sel_batch != "All":
-        shown = shown[shown["Batch / Lot"].astype(str) == sel_batch]
-    if sel_status != "All":
-        shown = shown[shown["Status"].astype(str).str.upper() == sel_status]
-    if search.strip():
-        s = search.lower()
-        mask = shown.astype(str).apply(lambda col: col.str.lower().str.contains(re.escape(s), na=False)).any(axis=1)
-        shown = shown[mask]
-    st.dataframe(shown, use_container_width=True, hide_index=True)
-    with st.expander("Edit full physicals table", expanded=not len(phys)):
-        edited = st.data_editor(
-            phys, num_rows="dynamic", use_container_width=True, hide_index=True, key="lds_physical_editor",
-            column_config={
-                "Test": st.column_config.SelectboxColumn(options=PHYSICAL_TESTS),
-                "Status": st.column_config.SelectboxColumn(options=["OPEN", "PASS", "FAIL", "RESULT", "N.A.", "CARRYOVER"]),
-            },
-        )
-        st.session_state.lds_physicals = recalc_status(clean_frame(edited, PHYSICAL_COLUMNS), "LSL", "USL")
-
-with tabs[3]:
-    st.markdown("### Dyno results & repeats")
-    st.caption("Keep repeats, criteria and source references separate so development decisions remain traceable.")
-    f1, f2, f3 = st.columns([1, 1, 2])
-    batch_options = ["All"] + sorted({str(x) for x in dyno["Batch / Lot"].dropna() if str(x).strip()})
-    sel_batch = f1.selectbox("Batch filter", batch_options, key="dyno_batch_filter")
-    sel_status = f2.selectbox("Status filter", ["All", "OPEN", "PASS", "FAIL", "RESULT", "N.A.", "CARRYOVER"], key="dyno_status_filter")
-    search = f3.text_input("Search test / metric / notes", key="dyno_search")
-    shown = dyno.copy()
-    if sel_batch != "All":
-        shown = shown[shown["Batch / Lot"].astype(str) == sel_batch]
-    if sel_status != "All":
-        shown = shown[shown["Status"].astype(str).str.upper() == sel_status]
-    if search.strip():
-        s = search.lower()
-        mask = shown.astype(str).apply(lambda col: col.str.lower().str.contains(re.escape(s), na=False)).any(axis=1)
-        shown = shown[mask]
-    st.dataframe(shown, use_container_width=True, hide_index=True)
-    with st.expander("Edit full dyno table", expanded=not len(dyno)):
-        edited = st.data_editor(
-            dyno, num_rows="dynamic", use_container_width=True, hide_index=True, key="lds_dyno_editor",
-            column_config={
-                "Test": st.column_config.SelectboxColumn(options=DYNO_TESTS),
-                "Status": st.column_config.SelectboxColumn(options=["OPEN", "PASS", "FAIL", "RESULT", "N.A.", "CARRYOVER"]),
-            },
-        )
-        st.session_state.lds_dyno = recalc_status(clean_frame(edited, DYNO_COLUMNS), "Min", "Max")
-
-with tabs[4]:
-    st.markdown("### Batch comparison & history")
-    all_batches = sorted(set(
-        [str(x) for x in batches["Batch / Lot"].dropna()] +
-        [str(x) for x in phys["Batch / Lot"].dropna()] +
-        [str(x) for x in dyno["Batch / Lot"].dropna()]
-    ))
-    selected = st.multiselect("Batches to compare", all_batches, default=all_batches[: min(3, len(all_batches))])
-    if not selected:
-        st.info("Select at least one batch.")
+    if not ptests:st.info("No physical records detected.")
     else:
-        p = phys[phys["Batch / Lot"].astype(str).isin(selected)].copy()
-        d = dyno[dyno["Batch / Lot"].astype(str).isin(selected)].copy()
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("#### Physicals")
-            if len(p):
-                st.dataframe(p, use_container_width=True, hide_index=True)
-                p["Numeric result"] = p["Result"].map(to_num)
-                plot = p.dropna(subset=["Numeric result"])
-                if len(plot):
-                    fig = px.scatter(plot, x="Test", y="Numeric result", color="Batch / Lot", symbol="Status", title="Physical-result comparison")
-                    fig.update_layout(template="plotly_white", xaxis_tickangle=-35)
-                    st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.caption("No physical records for selected batches.")
-        with c2:
-            st.markdown("#### Dyno")
-            if len(d):
-                st.dataframe(d, use_container_width=True, hide_index=True)
-                d["Numeric result"] = d["Result"].map(to_num)
-                plot = d.dropna(subset=["Numeric result"]).copy()
-                if len(plot):
-                    plot["Label"] = plot["Test"].astype(str) + " · " + plot["Metric"].fillna("").astype(str)
-                    fig = px.scatter(plot, x="Label", y="Numeric result", color="Batch / Lot", symbol="Status", title="Dyno-result comparison")
-                    fig.update_layout(template="plotly_white", xaxis_tickangle=-35)
-                    st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.caption("No dyno records for selected batches.")
-
+        test=st.selectbox("Physical characteristic",ptests,key="lds_phys_test"); x=numeric(p,test,selected); st.dataframe(p[p.Test.astype(str)==test],use_container_width=True,hide_index=True)
+        if len(x):
+            fig=px.box(x,x="Batch / Lot",y="Result numeric",color="Batch / Lot",points="all",title=f"{test} - batch distribution") if x.groupby("Batch / Lot").size().max()>1 else px.line(x,x="Batch / Lot",y="Result numeric",markers=True,title=f"{test} - batch comparison")
+            st.plotly_chart(add_limits(fig,x),use_container_width=True)
+with tabs[3]:
+    if not dtests:st.info("No dyno records detected.")
+    else:
+        test=st.selectbox("Dyno test",dtests,key="lds_dyno_test"); x=numeric(d,test,selected); st.dataframe(d[d.Test.astype(str)==test],use_container_width=True,hide_index=True)
+        if len(x):
+            fig=px.box(x,x="Batch / Lot",y="Result numeric",color="Batch / Lot",points="all",title=f"{test} - repeats / batch distribution") if x.groupby("Batch / Lot").size().max()>1 else px.line(x,x="Batch / Lot",y="Result numeric",markers=True,title=f"{test} - batch comparison")
+            st.plotly_chart(add_limits(fig,x),use_container_width=True)
+with tabs[4]:
+    c1,c2=st.columns(2); c1.markdown("#### Physical matrix");c1.dataframe(matrix(p,selected),use_container_width=True);c2.markdown("#### Dyno matrix");c2.dataframe(matrix(d,selected),use_container_width=True)
+    for title,df in [("Physicals",p),("Dyno",d)]:
+        if len(df):
+            pv=df.pivot_table(index="Test",columns="Batch / Lot",values="Status",aggfunc=lambda z:list(z)[-1]).reindex(columns=[x for x in selected if x in set(df["Batch / Lot"].astype(str))]); code=pv.applymap(lambda x:{"FAIL":-1,"OPEN":0,"RESULT":1,"PASS":2,"CARRYOVER":2,"N.A.":1}.get(str(x).upper(),1)); fig=px.imshow(code,x=code.columns,y=code.index,aspect="auto",color_continuous_scale=[(0,"#f8c9c5"),(.33,"#fff1bf"),(.66,"#dbe9f6"),(1,"#cce8cf")],zmin=-1,zmax=2,title=f"{title} status matrix");fig.update_layout(coloraxis_showscale=False,height=max(320,30*len(code)+130));st.plotly_chart(fig,use_container_width=True)
 with tabs[5]:
-    st.markdown("### Action tracker")
-    st.caption("Convert missing evidence, failed criteria and supplier follow-ups into traceable actions.")
-    edited = st.data_editor(
-        actions, num_rows="dynamic", use_container_width=True, hide_index=True, key="lds_action_editor",
-        column_config={
-            "Priority": st.column_config.SelectboxColumn(options=["High", "Medium", "Low"]),
-            "Status": st.column_config.SelectboxColumn(options=["Open", "In progress", "Blocked", "Closed"]),
-        },
-    )
-    st.session_state.lds_actions = clean_frame(edited, ACTION_COLUMNS)
-
+    a,bx,c=st.columns([1,2,1]); area=a.radio("Dataset",["Physicals","Dyno"]); source=p if area=="Physicals" else d; tests=ptests if area=="Physicals" else dtests
+    if tests:
+        test=bx.selectbox("Test / characteristic",tests,key="lds_studio"); typ=c.selectbox("Graphic",["Trend","Box plot","Histogram"]); x=numeric(source,test,selected)
+        if len(x):
+            if typ=="Histogram":fig=px.histogram(x,x="Result numeric",color="Batch / Lot",barmode="overlay",marginal="box",title=f"{test} - distribution")
+            elif typ=="Box plot":fig=add_limits(px.box(x,x="Batch / Lot",y="Result numeric",color="Batch / Lot",points="all",title=f"{test} - batch distribution"),x)
+            else:
+                ag=x.groupby("Batch / Lot",as_index=False)["Result numeric"].mean(); fig=add_limits(px.line(ag,x="Batch / Lot",y="Result numeric",markers=True,title=f"{test} - trend"),x)
+            fig.update_layout(template="plotly_white");st.plotly_chart(fig,use_container_width=True)
 with tabs[6]:
-    st.markdown("### Import existing LDS / restore backup")
-    uploaded = st.file_uploader("Upload LDS Excel workbook", type=["xlsx", "xls"], key="lds_import_file")
-    if uploaded is not None:
-        try:
-            raw = uploaded.getvalue()
-            xls = pd.ExcelFile(BytesIO(raw))
-            st.success(f"Workbook opened: {len(xls.sheet_names)} sheet(s). Blank Excel cells remain blank.")
-            overview = []
-            loaded = {}
-            for sheet in xls.sheet_names:
-                df = pd.read_excel(BytesIO(raw), sheet_name=sheet, dtype=object)
-                df = df.dropna(how="all").dropna(axis=1, how="all")
-                loaded[sheet] = df
-                overview.append({"Sheet": sheet, "Rows": len(df), "Columns": len(df.columns), "Detected as": classify_sheet(sheet, df)})
-            st.dataframe(pd.DataFrame(overview), use_container_width=True, hide_index=True)
+    gaps=pd.concat([p[p.Status.astype(str).str.upper().isin(["OPEN","FAIL"])].assign(Area="Physicals"),d[d.Status.astype(str).str.upper().isin(["OPEN","FAIL"])].assign(Area="Dyno")],ignore_index=True,sort=False)
+    if len(gaps):st.dataframe(gaps,use_container_width=True,hide_index=True)
+    else:st.success("No OPEN or FAIL records for selected batches.")
+    if len(unmapped):st.warning("Unmapped workbook rows are excluded from calculations until the parser is adapted.");st.dataframe(unmapped,use_container_width=True,hide_index=True)
+with tabs[7]:
+    e1,e2=st.columns(2); rpt_p=e1.selectbox("Physical chart in PDF",[None]+ptests,index=1 if ptests else 0); rpt_d=e2.selectbox("Dyno chart in PDF",[None]+dtests,index=1 if dtests else 0)
+    pdf=build_lds_pdf(file_name=name,batches_df=batches,phys=p,dyno=d,unmapped=unmapped,selected_batches=selected,physical_test=rpt_p,dyno_test=rpt_d); xlsx=excel_export(name,batches,p,d,unmapped,diag,selected); z=graphic_zip(p,d,selected,rpt_p,rpt_d);safe=re.sub(r"[^A-Za-z0-9_-]+","_",name.rsplit(".",1)[0]) or "LDS"
+    cols=st.columns(3);cols[0].download_button("Engineering report (.pdf)",pdf,f"{safe}_Engineering_Report.pdf","application/pdf",use_container_width=True,type="primary");cols[1].download_button("Analysis package (.xlsx)",xlsx,f"{safe}_Analysis.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True);cols[2].download_button("Graphics pack (.zip)",z,f"{safe}_Graphics.zip","application/zip",use_container_width=True)
+with tabs[8]:
+    st.caption("Automatic import is auditable. Unknown rows are kept here instead of being forced into a wrong category.");st.dataframe(diag,use_container_width=True,hide_index=True)
+    if len(unmapped):st.dataframe(unmapped,use_container_width=True,hide_index=True)
 
-            sheet = st.selectbox("Sheet to import", xls.sheet_names)
-            source = loaded[sheet]
-            st.dataframe(source.head(100), use_container_width=True, hide_index=True)
-            detected = classify_sheet(sheet, source)
-            choices = ["Batches", "Physicals", "Dyno", "Actions"]
-            target = st.selectbox("Import this sheet as", choices, index=choices.index(detected) if detected in choices else 0)
-
-            target_columns = {
-                "Batches": BATCH_COLUMNS, "Physicals": PHYSICAL_COLUMNS, "Dyno": DYNO_COLUMNS, "Actions": ACTION_COLUMNS,
-            }[target]
-            mapped = map_columns(source, target_columns, f"map_{sheet}_{target}")
-            st.markdown("#### Review before import")
-            st.dataframe(mapped.head(100), use_container_width=True, hide_index=True)
-
-            mode = st.radio("Import mode", ["Append", "Replace this LDS table"], horizontal=True)
-            if st.button(f"Import {target}", type="primary"):
-                key = {"Batches": "lds_batches", "Physicals": "lds_physicals", "Dyno": "lds_dyno", "Actions": "lds_actions"}[target]
-                if mode == "Append":
-                    st.session_state[key] = pd.concat([st.session_state[key], mapped], ignore_index=True)
-                else:
-                    st.session_state[key] = mapped.reset_index(drop=True)
-                if target == "Physicals":
-                    st.session_state[key] = recalc_status(st.session_state[key], "LSL", "USL")
-                if target == "Dyno":
-                    st.session_state[key] = recalc_status(st.session_state[key], "Min", "Max")
-                st.success(f"{len(mapped)} row(s) imported into {target}.")
-                st.rerun()
-        except Exception as exc:
-            st.error(f"Could not import workbook: {exc}")
-
-    st.divider()
-    st.markdown("### Export")
-    st.download_button(
-        "Download complete LDS workspace (.xlsx)", workspace_excel_bytes(), "LDS_Friction_Lab_Backup.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, type="primary",
-    )
-    export_json = {
-        "batches": st.session_state.lds_batches.to_dict(orient="records"),
-        "physicals": st.session_state.lds_physicals.to_dict(orient="records"),
-        "dyno": st.session_state.lds_dyno.to_dict(orient="records"),
-        "actions": st.session_state.lds_actions.to_dict(orient="records"),
-    }
-    st.download_button(
-        "Download JSON backup", json.dumps(export_json, default=str, indent=2).encode("utf-8"),
-        "LDS_Friction_Lab_Backup.json", "application/json", use_container_width=True,
-    )
-
-st.divider()
-st.caption(
-    "LDS Friction Lab is intended for development traceability and supplier review. "
-    "Automatic PASS/FAIL applies only when a numeric result and numeric limit are available; engineering judgement remains necessary for qualitative evidence and carry-over decisions."
-)
+st.divider();st.caption("Automatic PASS/FAIL is applied only where numeric criteria exist in the LDS. Final acceptance remains an engineering decision under the applicable project/customer requirements.")
