@@ -21,6 +21,9 @@ pages = {
         st.Page("pages/process_capability.py", title="Process Capability", icon="📊"),
         st.Page("pages/compressibility.py", title="Compressibility Analysis", icon="🗜️"),
     ],
+    "Supplier Development": [
+        st.Page("pages/lds_friction_lab.py", title="LDS Friction Lab", icon="🧪"),
+    ],
     "Performance": [
         st.Page("pages/friction_analysis.py", title="Friction Analysis", icon="📈"),
         st.Page("pages/wear_analysis.py", title="Wear Analysis", icon="🛞"),
