@@ -8,8 +8,8 @@ hero(
 )
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Live tools", "1", help="Fully usable modules in this version")
-c2.metric("Roadmap modules", "7")
+c1.metric("Live tools", "2", help="Fully usable modules in this version")
+c2.metric("Roadmap modules", "6")
 c3.metric("Data input", "Excel · Paste · Manual")
 c4.metric("Sample size", "Dynamic", help="No fixed 50/75/100/500-pad limit")
 
@@ -23,16 +23,12 @@ with left:
     )
     st.page_link("pages/process_capability.py", label="Open Process Capability", icon="➡️", use_container_width=True)
 with right:
-    st.markdown(
-        """
-        <div class="pdt-card">
-            <span class="pdt-badge-live">Platform concept</span>
-            <h3>One app, multiple engineering tools</h3>
-            <p>The capability calculator is now one module inside a larger pad-development workspace. Future tools can be added without creating a new website or changing the navigation structure.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    tool_card(
+        "🧪 LDS Friction Lab",
+        "Track supplier friction batches, process traceability, physical properties, dyno results, open gaps and actions in one LDS workspace.",
+        "Live",
     )
+    st.page_link("pages/lds_friction_lab.py", label="Open LDS Friction Lab", icon="➡️", use_container_width=True)
 
 st.markdown("### Tool portfolio")
 row1 = st.columns(4)
