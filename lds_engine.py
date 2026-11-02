@@ -203,41 +203,103 @@ def _wide_parse(raw: pd.DataFrame,sheet:str,seq_start:int):
         vals=raw.iloc[i].tolist(); idx=[j for j,v in enumerate(vals) if is_batch_header(v)]
         if len(idx)>=2 and (best is None or len(idx)>len(best[1])): best=(i,idx)
     if best is None:return [],[],[],[],seq_start
-    h,bidx=best; headers=raw.iloc[h].tolist(); batch_names={j:s(headers[j]) for j in bidx}
+
+    h,bidx=best
+    batch_names={j:s(raw.iat[h,j]) for j in bidx}
+
+    # Astemo-style LDS uses batch IDs on one row and "Result / Status / Report Ref."
+    # directly below. Requirement headers (Characteristic, LSL, Target, USL, Unit)
+    # are therefore taken from the sub-header row when present.
+    sub_h=h+1 if h+1 < len(raw) else h
+    subheaders=raw.iloc[sub_h].tolist()
+
+    # Keep only true result columns for each batch group. A batch ID should have a
+    # Result sub-header below it; generic wide sheets without a second header still work.
+    result_idx=[]
+    filtered_names={}
+    for j,b in batch_names.items():
+        sh=norm(subheaders[j]) if j < len(subheaders) else ""
+        if sh in {"result","value","measurement","measured"} or sub_h==h:
+            result_idx.append(j); filtered_names[j]=b
+        else:
+            # In merged-cell imports the batch ID lands on the first column of the group,
+            # which is normally the Result column even if the sub-header is blank.
+            if j+1 < raw.shape[1] and norm(subheaders[j+1])=="status":
+                result_idx.append(j); filtered_names[j]=b
+    if result_idx:
+        bidx=result_idx; batch_names=filtered_names
+
     pre=[j for j in range(raw.shape[1]) if j not in bidx]
     if not pre:return [],[],[],[],seq_start
-    def text_score(j):
-        vals=[s(v) for v in raw.iloc[h+1:,j].tolist()]
-        return sum(bool(v) and num(v) is None for v in vals)
-    desc=max(pre,key=text_score)
-    header_norm={j:norm(headers[j]) for j in pre}
+
+    header_norm={j:norm(subheaders[j]) for j in pre}
+    desc=next((j for j in pre if "characteristic" in header_norm[j] or header_norm[j] in {"test","parameter","characteristic / test"}),None)
+    if desc is None:
+        def text_score(j):
+            vals=[s(v) for v in raw.iloc[sub_h+1:,j].tolist()]
+            return sum(bool(v) and num(v) is None for v in vals)
+        desc=max(pre,key=text_score)
+
     unit_col=next((j for j in pre if "unit" in header_norm[j]),None)
-    lsl_col=next((j for j in pre if header_norm[j] in {"lsl","min","minimum","lower"} or "lsl" in header_norm[j]),None)
-    usl_col=next((j for j in pre if header_norm[j] in {"usl","max","maximum","upper"} or "usl" in header_norm[j]),None)
+    lsl_col=next((j for j in pre if header_norm[j] in {"lsl","lsl / min","min","minimum","lower"} or "lsl" in header_norm[j]),None)
+    usl_col=next((j for j in pre if header_norm[j] in {"usl","usl / max","max","maximum","upper"} or "usl" in header_norm[j]),None)
     target_col=next((j for j in pre if "target" in header_norm[j] or "nominal" in header_norm[j]),None)
+
     batch_meta={b:{"Batch / Lot":b,"Source sheet":sheet} for b in batch_names.values()}
     phys=[];dyno=[];unm=[]
-    for ri in range(h+1,len(raw)):
+    data_start=sub_h+1
+
+    for ri in range(data_start,len(raw)):
         descriptor=s(raw.iat[ri,desc])
-        if not descriptor:continue
-        nd=norm(descriptor); meta_field=None
+        if not descriptor: continue
+        nd=norm(descriptor)
+
+        # Batch/material passport rows.
+        meta_field=None
         for k,v in META_MAP.items():
             if nd==k or nd.startswith(k+" "): meta_field=v;break
+        if nd=="reference batch": meta_field="Reference batch"
+        elif nd=="4m change": meta_field="4M change"
+        elif nd=="process deviation": meta_field="Process deviation"
+        elif nd in {"batch notes","notes"}: meta_field="Notes"
+
         if meta_field:
-            for j,b in batch_names.items(): batch_meta[b][meta_field]=s(raw.iat[ri,j])
+            for j,b in batch_names.items():
+                batch_meta[b][meta_field]=s(raw.iat[ri,j])
             continue
+
         role=role_for(descriptor,sheet)
         if role=="unknown":
+            # Engineering-assessment / commentary rows are preserved as unmapped,
+            # rather than being forced into physical/dyno calculations.
             if any(s(raw.iat[ri,j]) for j in bidx):
-                unm.append({"Source sheet":sheet,"Source row":ri+1,"Descriptor":descriptor,"Value":" | ".join(f"{batch_names[j]}={s(raw.iat[ri,j])}" for j in bidx if s(raw.iat[ri,j])),"Reason":"Unclassified wide-format row"})
+                unm.append({
+                    "Source sheet":sheet,"Source row":ri+1,"Descriptor":descriptor,
+                    "Value":" | ".join(f"{batch_names[j]}={s(raw.iat[ri,j])}" for j in bidx if s(raw.iat[ri,j])),
+                    "Reason":"Engineering/comment row not used in numeric analysis",
+                })
             continue
-        unit=s(raw.iat[ri,unit_col]) if unit_col is not None else ""; lo=num(raw.iat[ri,lsl_col]) if lsl_col is not None else None; hi=num(raw.iat[ri,usl_col]) if usl_col is not None else None; tar=num(raw.iat[ri,target_col]) if target_col is not None else None
+
+        unit=s(raw.iat[ri,unit_col]) if unit_col is not None else ""
+        lo=num(raw.iat[ri,lsl_col]) if lsl_col is not None else None
+        hi=num(raw.iat[ri,usl_col]) if usl_col is not None else None
+        tar=num(raw.iat[ri,target_col]) if target_col is not None else None
+
         for j,b in batch_names.items():
             v=raw.iat[ri,j]
             if role=="physical":
-                phys.append({"Batch / Lot":b,"Test":descriptor,"Sample ID":"","Result":v,"Result numeric":num(v),"Unit":unit,"LSL":lo,"USL":hi,"Target":tar,"Status":status(v,lo,hi),"Source sheet":sheet,"Source row":ri+1})
+                phys.append({
+                    "Batch / Lot":b,"Test":descriptor,"Sample ID":"","Result":v,
+                    "Result numeric":num(v),"Unit":unit,"LSL":lo,"USL":hi,"Target":tar,
+                    "Status":status(v,lo,hi),"Source sheet":sheet,"Source row":ri+1,
+                })
             else:
-                dyno.append({"Batch / Lot":b,"Test":descriptor,"Metric":descriptor,"Run":"","Result":v,"Result numeric":num(v),"Unit":unit,"Min":lo,"Max":hi,"Target":tar,"Status":status(v,lo,hi),"Source sheet":sheet,"Source row":ri+1})
+                dyno.append({
+                    "Batch / Lot":b,"Test":descriptor,"Metric":descriptor,"Run":"","Result":v,
+                    "Result numeric":num(v),"Unit":unit,"Min":lo,"Max":hi,"Target":tar,
+                    "Status":status(v,lo,hi),"Source sheet":sheet,"Source row":ri+1,
+                })
+
     batches=[];seq=seq_start
     for b,rec in batch_meta.items():
         seq+=1;rec["Sequence"]=seq;batches.append(rec)
