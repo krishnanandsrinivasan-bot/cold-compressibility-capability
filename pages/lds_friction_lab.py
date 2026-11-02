@@ -59,14 +59,22 @@ def matrix(df,batches):
     d["Display"]=d.apply(lambda r: f"{'' if pd.isna(r['Result']) else r['Result']} {r.get('Unit') or ''} [{r.get('Status') or ''}]".strip(),axis=1)
     return d.pivot_table(index="Test",columns="Batch / Lot",values="Display",aggfunc=lambda x:" | ".join(dict.fromkeys(map(str,x)))).reindex(columns=[b for b in batches if b in set(d["Batch / Lot"].astype(str))])
 
+COMPLETENESS_COLUMNS=["Batch / Lot","Records","Completed","Open","Fail","Completeness %"]
+
 def completeness(p,d,batches):
     rows=[]
-    for b in batches:
-        pb=p[p["Batch / Lot"].astype(str)==b]; db=d[d["Batch / Lot"].astype(str)==b]
-        total=len(pb)+len(db); open_n=int((pb["Status"].astype(str).str.upper()=="OPEN").sum())+int((db["Status"].astype(str).str.upper()=="OPEN").sum())
-        fail=int((pb["Status"].astype(str).str.upper()=="FAIL").sum())+int((db["Status"].astype(str).str.upper()=="FAIL").sum())
-        rows.append({"Batch / Lot":b,"Records":total,"Completed":total-open_n,"Open":open_n,"Fail":fail,"Completeness %":round(100*(total-open_n)/total,1) if total else np.nan})
-    return pd.DataFrame(rows)
+    p=p.copy() if isinstance(p,pd.DataFrame) else pd.DataFrame()
+    d=d.copy() if isinstance(d,pd.DataFrame) else pd.DataFrame()
+    for b in list(batches or []):
+        pb=p[p["Batch / Lot"].astype(str)==str(b)] if "Batch / Lot" in p.columns else pd.DataFrame()
+        db=d[d["Batch / Lot"].astype(str)==str(b)] if "Batch / Lot" in d.columns else pd.DataFrame()
+        p_status=pb["Status"].astype(str).str.upper() if "Status" in pb.columns else pd.Series(dtype=str)
+        d_status=db["Status"].astype(str).str.upper() if "Status" in db.columns else pd.Series(dtype=str)
+        total=len(pb)+len(db)
+        open_n=int((p_status=="OPEN").sum())+int((d_status=="OPEN").sum())
+        fail=int((p_status=="FAIL").sum())+int((d_status=="FAIL").sum())
+        rows.append({"Batch / Lot":str(b),"Records":total,"Completed":max(total-open_n,0),"Open":open_n,"Fail":fail,"Completeness %":round(100*(total-open_n)/total,1) if total else np.nan})
+    return pd.DataFrame(rows,columns=COMPLETENESS_COLUMNS)
 
 def excel_export(name,batches,p,d,unmapped,diag,selected):
     out=BytesIO(); gaps=pd.concat([p[p.Status.astype(str).str.upper().isin(["OPEN","FAIL"])].assign(Area="Physicals"),d[d.Status.astype(str).str.upper().isin(["OPEN","FAIL"])].assign(Area="Dyno")],ignore_index=True,sort=False)
@@ -121,8 +129,14 @@ tabs=st.tabs(["Dashboard","Batch Profile","Physicals","Dyno","Batch Comparison",
 with tabs[0]:
     comp=completeness(p,d,selected); c1,c2=st.columns([1.4,1])
     with c1:
-        m=comp.melt(id_vars=["Batch / Lot"],value_vars=["Completed","Open"],var_name="Evidence",value_name="Records")
-        fig=px.bar(m,x="Batch / Lot",y="Records",color="Evidence",barmode="stack",title="LDS evidence completeness");fig.update_layout(template="plotly_white",legend_title_text="");st.plotly_chart(fig,use_container_width=True)
+        required={"Batch / Lot","Completed","Open"}
+        if comp.empty or not required.issubset(comp.columns):
+            st.info("No completeness data could be calculated for the selected batches. Review Import Diagnostics to see how the LDS was interpreted.")
+        else:
+            m=comp[["Batch / Lot","Completed","Open"]].melt(id_vars=["Batch / Lot"],value_vars=["Completed","Open"],var_name="Evidence",value_name="Records")
+            fig=px.bar(m,x="Batch / Lot",y="Records",color="Evidence",barmode="stack",title="LDS evidence completeness")
+            fig.update_layout(template="plotly_white",legend_title_text="")
+            st.plotly_chart(fig,use_container_width=True)
     with c2:
         st.markdown("#### Engineering attention")
         if fail_n:st.error(f"{fail_n} numeric result(s) fail imported criteria.")
